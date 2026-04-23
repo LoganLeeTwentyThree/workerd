@@ -5,9 +5,9 @@
 // TODO(cleanup): C++ built-in modules do not yet support named exports, so we must define this
 //   wrapper module that simply re-exports the classes from the built-in module.
 
-import entrypoints from 'cloudflare-internal:workers';
 import innerEnv from 'cloudflare-internal:env';
 import innerTracing from 'cloudflare-internal:tracing';
+import entrypoints from 'cloudflare-internal:workers';
 
 export const WorkerEntrypoint = entrypoints.WorkerEntrypoint;
 export const DurableObject = entrypoints.DurableObject;
@@ -24,6 +24,7 @@ type ExecuteFn = (
   rollbackConfig: RollbackConfig
 ) => Promise<unknown>;
 type RunFn = (event: unknown, step: unknown, ...rest: unknown[]) => unknown;
+type StepCallback = (ctx: unknown, dedupName: string) => unknown;
 
 interface StepRpcStub {
   do(...args: unknown[]): Promise<unknown>;
@@ -182,6 +183,43 @@ function wrapStep(jsStep: StepRpcStub): StepRpcStub {
   });
 }
 
+// Wraps step.do() callback execution in a tracing span. Rollback support appends
+// rollback args after the user callback, so the callback is identified by the
+// step.do(name, config?, callback) shape rather than by taking the last arg.
+function wrapStepForTracing(jsStep: StepRpcStub): StepRpcStub {
+  return new Proxy(jsStep, {
+    get(
+      target: StepRpcStub,
+      prop: string | symbol,
+      receiver: unknown
+    ): unknown {
+      if (prop !== 'do') {
+        return Reflect.get(target, prop, receiver) as unknown;
+      }
+
+      return (name: unknown, ...rest: unknown[]): Promise<unknown> => {
+        const callbackIndex = typeof rest[0] === 'function' ? 0 : 1;
+        const userCb = rest[callbackIndex];
+        if (typeof userCb !== 'function') {
+          throw new Error('No step callback was defined');
+        }
+
+        const callback = userCb as StepCallback;
+        rest[callbackIndex] = (ctx: unknown, dedupName: string): unknown =>
+          innerTracing.enterSpan('workflow_step_do', (span) => {
+            span.setAttribute('cloudflare.workflow.step.name', String(name));
+            span.setAttribute(
+              'cloudflare.workflow.step.unique_name',
+              dedupName
+            );
+            return callback(ctx, dedupName);
+          });
+        return target.do(name, ...rest);
+      };
+    },
+  });
+}
+
 // Wraps a run function so that its second argument (step) is replaced with wrapStep(step).
 function makeWrappedRun(originalRun: RunFn): RunFn {
   return function (
@@ -199,9 +237,9 @@ function makeWrappedRun(originalRun: RunFn): RunFn {
   };
 }
 
-// Wrap WorkflowEntrypoint to intercept run() calls and wrap the step argument before it reaches
-// user code. This provides an extension point for step-level features (rollback, future additions)
-// without modifying the C++ entrypoint.
+// Wrap WorkflowEntrypoint to intercept internal _run_step() calls for tracing,
+// and optionally wrap run() so rollback support can decorate the step argument
+// before it reaches user code.
 //
 // We use a JS subclass (not a Proxy) because the runtime walks the constructor prototype chain
 // to classify entrypoints (workflowClasses vs actorClasses vs statelessClasses). A Proxy breaks
@@ -211,19 +249,23 @@ function makeWrappedRun(originalRun: RunFn): RunFn {
 // double-wrap on the second instantiation of the same class.
 const wrappedProtos = new WeakSet<object>();
 
-class WorkflowEntrypointWrapper extends entrypoints.WorkflowEntrypoint {
+class WorkflowEntrypointImpl extends entrypoints.WorkflowEntrypoint {
   constructor(ctx: unknown, env: unknown) {
     super(ctx, env);
 
+    if (!Cloudflare.compatibilityFlags.workflows_step_rollback) {
+      return;
+    }
+
     // Walk the prototype chain to find the prototype that owns run() and wrap it.
-    // We stop at WorkflowEntrypointWrapper.prototype to avoid patching the C++ base.
+    // We stop at WorkflowEntrypointImpl.prototype to avoid patching this wrapper or the C++ base.
     // This handles inheritance: class B extends A extends WorkflowEntrypoint where
     // only A defines run() — getPrototypeOf(b) is B.prototype which doesn't own run,
     // so we walk up to A.prototype which does.
     let proto: Record<string, unknown> | null = Object.getPrototypeOf(
       this
     ) as Record<string, unknown>;
-    const stop = WorkflowEntrypointWrapper.prototype as unknown;
+    const stop = WorkflowEntrypointImpl.prototype as unknown;
     while (proto !== null && proto !== stop) {
       if (
         !wrappedProtos.has(proto) &&
@@ -244,12 +286,19 @@ class WorkflowEntrypointWrapper extends entrypoints.WorkflowEntrypoint {
     // This is a workerd-level constraint that applies to all entrypoints (WorkerEntrypoint,
     // DurableObject, WorkflowEntrypoint).
   }
+
+  // @ts-expect-error TS-private but callable via RPC; same convention as pipeline-transform.ts.
+  // eslint-disable-next-line no-restricted-syntax
+  private async _run_step(event: unknown, step: object): Promise<unknown> {
+    const tracedStep = wrapStepForTracing(step as StepRpcStub);
+
+    return (
+      this as unknown as { run: (e: unknown, s: unknown) => Promise<unknown> }
+    ).run(event, tracedStep);
+  }
 }
 
-export const WorkflowEntrypoint = Cloudflare.compatibilityFlags
-  .workflows_step_rollback
-  ? WorkflowEntrypointWrapper
-  : entrypoints.WorkflowEntrypoint;
+export const WorkflowEntrypoint = WorkflowEntrypointImpl;
 
 export function withEnv(newEnv: unknown, fn: () => unknown): unknown {
   return innerEnv.withEnv(newEnv, fn);
