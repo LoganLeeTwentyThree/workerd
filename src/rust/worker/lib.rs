@@ -17,6 +17,7 @@ pub mod error;
 pub mod exception;
 pub mod ffi;
 pub mod kill_switch;
+pub mod ok;
 
 use std::pin::Pin;
 use std::time::SystemTime;

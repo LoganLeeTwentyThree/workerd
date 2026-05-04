@@ -8,6 +8,7 @@
 #include <workerd/rust/worker/bridge.h>
 #include <workerd/rust/worker/error.rs.h>
 #include <workerd/rust/worker/kill_switch.rs.h>
+#include <workerd/rust/worker/ok.rs.h>
 #include <workerd/util/exception.h>
 
 #include <kj-rs/kj-rs.h>
@@ -22,13 +23,44 @@ namespace workerd {
 namespace {
 
 // Reusable mock response implementations
+class MemoryOutputStream final: public kj::AsyncOutputStream, public kj::Refcounted {
+ public:
+  kj::Promise<void> write(kj::ArrayPtr<const kj::byte> buffer) override {
+    content.addAll(buffer);
+    return kj::READY_NOW;
+  }
+
+  kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const kj::byte>> pieces) override {
+    for (auto piece: pieces) {
+      content.addAll(piece);
+    }
+    return kj::READY_NOW;
+  }
+
+  kj::Promise<void> whenWriteDisconnected() override {
+    return kj::NEVER_DONE;
+  }
+
+  kj::String str() const {
+    return kj::str(content.asPtr().asChars());
+  }
+
+  kj::Vector<kj::byte> content;
+};
+
 class TestResponse: public kj::HttpService::Response {
  public:
+  uint statusCode = 0;
+  kj::String statusText;
+  kj::Rc<MemoryOutputStream> body = kj::rc<MemoryOutputStream>();
+
   kj::Own<kj::AsyncOutputStream> send(uint statusCode,
       kj::StringPtr statusText,
       const kj::HttpHeaders& headers,
       kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
-    KJ_UNIMPLEMENTED("Response not implemented in test");
+    this->statusCode = statusCode;
+    this->statusText = kj::str(statusText);
+    return body.addRef().toOwn();
   }
 
   kj::Own<kj::WebSocket> acceptWebSocket(const kj::HttpHeaders& headers) override {
@@ -81,6 +113,30 @@ KJ_TEST("kill_switch worker") {
   KJ_ASSERT(e.getType() == kj::Exception::Type::OVERLOADED);
   KJ_ASSERT(e.getDescription() == "jsg.Error: This script has been killed.");
   KJ_ASSERT(e.getDetail(SCRIPT_KILLED_DETAIL_ID) != kj::none);
+}
+
+KJ_TEST("ok worker request") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+
+  auto worker = kj::from<Rust>(new_ok_worker());
+
+  kj::HttpMethod method = kj::HttpMethod::GET;
+  kj::StringPtr url = "/";
+  kj::HttpHeaderTable headerTable;
+  kj::HttpHeaders headers(headerTable);
+
+  auto pipeBody = kj::newOneWayPipe();
+  pipeBody.out = nullptr;
+  kj::AsyncInputStream& requestBody = *pipeBody.in;
+
+  TestResponse response;
+
+  worker->request(method, url, headers, requestBody, response).wait(waitScope);
+
+  KJ_ASSERT(response.statusCode == 200);
+  KJ_ASSERT(response.statusText == "OK");
+  KJ_ASSERT(response.body->str() == "OK");
 }
 
 KJ_TEST("kill_switch worker connect") {
